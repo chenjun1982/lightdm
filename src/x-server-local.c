@@ -66,6 +66,13 @@ typedef struct
 
     /* Background to set */
     gchar *background;
+
+    /* Retry configuration */
+    gboolean retry_on_connection_failure;
+    guint retry_timeout_seconds;
+    guint retry_max_count;
+    guint signal_retry_count;
+    guint timeout_source_id;
 } XServerLocalPrivate;
 
 static void x_server_local_logger_iface_init (LoggerInterface *iface);
@@ -362,18 +369,103 @@ x_server_local_get_log_stdout (XServerLocal *server)
     return TRUE;
 }
 
+static gboolean
+timeout_cb (gpointer user_data)
+{
+    XServerLocal *server = X_SERVER_LOCAL (user_data);
+    XServerLocalPrivate *priv = x_server_local_get_instance_private (server);
+    
+    l_debug (server, "Timeout reached for X server :%d, stopping retry mechanism", priv->display_number);
+    priv->timeout_source_id = 0;
+    priv->got_signal = TRUE; /* Prevent further retries */
+    
+    return G_SOURCE_REMOVE;
+}
+
 static void
 got_signal_cb (Process *process, int signum, XServerLocal *server)
 {
     XServerLocalPrivate *priv = x_server_local_get_instance_private (server);
 
-    if (signum == SIGUSR1 && !priv->got_signal)
+    if (signum == SIGUSR1)
     {
-        priv->got_signal = TRUE;
-        l_debug (server, "Got signal from X server :%d", priv->display_number);
+        if (!priv->got_signal)
+        {
+            /* Check if this is the first signal and we need to setup timeout */
+            if (priv->signal_retry_count == 0)
+            {
+                /* Read configuration for retry settings */
+                priv->retry_on_connection_failure = config_get_boolean (config_get_instance (), "Seat:*", "xserver-retry-on-connection-failure");
+                priv->retry_timeout_seconds = config_get_integer (config_get_instance (), "Seat:*", "xserver-retry-timeout");
+                priv->retry_max_count = config_get_integer (config_get_instance (), "Seat:*", "xserver-retry-max-count");
+                
+                /* Set default timeout to 5 seconds if not configured */
+                if (priv->retry_timeout_seconds <= 0)
+                    priv->retry_timeout_seconds = 5;
+                
+                /* Set default max attempts to 3 if not configured */
+                if (priv->retry_max_count <= 0)
+                    priv->retry_max_count = 3;
+                
+                /* Setup timeout if retry is enabled */
+                if (priv->retry_on_connection_failure)
+                {
+                    priv->timeout_source_id = g_timeout_add_seconds (priv->retry_timeout_seconds, timeout_cb, server);
+                    l_debug (server, "Setup retry timeout of %d seconds and max %d attempts for X server :%d", 
+                             priv->retry_timeout_seconds, priv->retry_max_count, priv->display_number);
+                }
+            }
+            
+            priv->signal_retry_count++;
+            l_debug (server, "Got signal from X server :%d (count %d/%d)", 
+                     priv->display_number, priv->signal_retry_count, priv->retry_max_count);
 
-        // FIXME: Check return value
-        DISPLAY_SERVER_CLASS (x_server_local_parent_class)->start (DISPLAY_SERVER (server));
+            gboolean result = DISPLAY_SERVER_CLASS (x_server_local_parent_class)->start (DISPLAY_SERVER (server));
+            
+            if (result)
+            {
+                /* Connection successful, clean up timeout if set */
+                if (priv->timeout_source_id > 0)
+                {
+                    g_source_remove (priv->timeout_source_id);
+                    priv->timeout_source_id = 0;
+                }
+                priv->got_signal = TRUE;
+                l_debug (server, "Connection to X server :%d successful", priv->display_number);
+            }
+            else
+            {
+                /* Connection failed */
+                if (priv->retry_on_connection_failure && 
+                    priv->timeout_source_id > 0 && 
+                    priv->signal_retry_count < priv->retry_max_count)
+                {
+                    /* Reset got_signal flag to allow retry on next signal */
+                    priv->got_signal = FALSE;
+                    l_debug (server, "Connection to X server :%d failed, waiting for next signal (count %d/%d)", 
+                             priv->display_number, priv->signal_retry_count, priv->retry_max_count);
+                }
+                else
+                {
+                    /* No retry, timeout reached, or max attempts reached */
+                    priv->got_signal = TRUE;
+                    if (priv->signal_retry_count >= priv->retry_max_count)
+                    {
+                        l_debug (server, "Connection to X server :%d failed, max attempts (%d) reached", 
+                                 priv->display_number, priv->retry_max_count);
+                    }
+                    else
+                    {
+                        l_debug (server, "Connection to X server :%d failed, no retry available", 
+                                 priv->display_number);
+                    }
+                }
+            }
+        }
+        else
+        {
+            l_debug (server, "Got additional signal from X server :%d (already processed)", priv->display_number);
+        }
     }
 }
 
@@ -383,6 +475,13 @@ stopped_cb (Process *process, XServerLocal *server)
     XServerLocalPrivate *priv = x_server_local_get_instance_private (server);
 
     l_debug (server, "X server stopped");
+
+    /* Clean up timeout source if set */
+    if (priv->timeout_source_id > 0)
+    {
+        g_source_remove (priv->timeout_source_id);
+        priv->timeout_source_id = 0;
+    }
 
     /* Release VT and display number for re-use */
     if (priv->have_vt_ref)
@@ -445,6 +544,8 @@ x_server_local_start (DisplayServer *display_server)
     g_return_val_if_fail (priv->x_server_process == NULL, FALSE);
 
     priv->got_signal = FALSE;
+    priv->signal_retry_count = 0;
+    priv->timeout_source_id = 0;
 
     g_return_val_if_fail (priv->command != NULL, FALSE);
 
